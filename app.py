@@ -1,519 +1,1032 @@
 """
-analysis.py  -  Multi-timeframe technical analysis for the OI Gate webhook app.
-
-For every signal it analyses the SPOT chart on:
-    signal timeframe  +  2 higher timeframes (HTF)
-and returns EMA20/50 state, price vs EMA, MACD bias + tick, RSI, divergences.
+OI Gate Unified Webhook  (TradingView -> Upstox OI check -> Telegram + MTF analysis)
+Run:  gunicorn app:app --workers 1 --threads 8 --timeout 60
 """
+import gzip
+import json
+import logging
+import math
+import os
 import re
 import threading
-from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
-from urllib.parse import quote
+import time
+from collections import deque
+from datetime import datetime
 
 import pytz
 import requests
+from flask import Flask, Response, jsonify, request
 
+import analysis
+
+# ============================================================
+# APP + LOGGING
+# ============================================================
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("oi-gate-unified")
 IST = pytz.timezone("Asia/Kolkata")
 
-# ------------------------------------------------------------------
-# Timeframe config
-# ------------------------------------------------------------------
-# signal TF  ->  (HTF1, HTF2)
-HTF_MAP = {
-    "1": ("5", "15"),
-    "3": ("15", "60"),
-    "5": ("15", "60"),
-    "15": ("60", "240"),
-    "30": ("60", "240"),
-    "60": ("240", "D"),
-    "240": ("D", "W"),
-    "D": ("W", "M"),
-    "W": ("M",),
-    "M": (),
+# ============================================================
+# CONFIG (environment variables)
+# ============================================================
+def _flag(name, default):
+    return os.environ.get(name, default).lower() in ("1", "true", "yes", "y", "on")
+
+
+UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
+OI_DROP_THRESHOLD = float(os.environ.get("OI_DROP_THRESHOLD", "-5.0"))
+DEFAULT_QUANTITY = os.environ.get("DEFAULT_QUANTITY", "").strip()
+OTM_LEVEL = int(os.environ.get("OTM_LEVEL", "1"))
+TEST_MODE = _flag("TEST_MODE", "true")
+ASYNC_WEBHOOK = _flag("ASYNC_WEBHOOK", "true")      # reply to TradingView instantly (3s limit)
+INSTRUMENT_MASTER_PATH = os.environ.get(
+    "INSTRUMENT_MASTER_PATH", os.environ.get("UPSTOX_CSV", "NSE.json.gz")).strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+UPSTOX_QUOTE_URL = "https://api.upstox.com/v2/market-quote/quotes"
+UPSTOX_CANDLE_URL = "https://api.upstox.com/v2/historical-candle/intraday"
+UPSTOX_ORDER_PLACE_URL = "https://api.upstox.com/v2/order/place"
+
+UPSTOX_HEADERS = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
 }
 
-# tf -> (upstox unit, interval, lookback days)
-TF_SPEC = {
-    "1": ("minutes", 1, 5),
-    "3": ("minutes", 3, 14),
-    "5": ("minutes", 5, 28),
-    "15": ("minutes", 15, 28),
-    "30": ("minutes", 30, 80),
-    "60": ("hours", 1, 85),
-    "240": ("hours", 4, 85),
-    "D": ("days", 1, 400),
-    "W": ("weeks", 1, 1500),
-    "M": ("months", 1, 3000),
+INDEX_SPOT_KEYS = {
+    "NIFTY": "NSE_INDEX|Nifty 50",
+    "BANKNIFTY": "NSE_INDEX|Nifty Bank",
+    "FINNIFTY": "NSE_INDEX|Nifty Fin Service",
+    "MIDCPNIFTY": "NSE_INDEX|NIFTY MID SELECT",
+    "SENSEX": "BSE_INDEX|SENSEX",
+}
+INDEX_STEP_MAP = {"NIFTY": 50, "FINNIFTY": 50, "MIDCPNIFTY": 25, "BANKNIFTY": 100, "SENSEX": 100}
+
+# ============================================================
+# GLOBAL STATE
+# ============================================================
+equity_map, spot_map, options_map, symbol_to_option_map = {}, {}, {}, {}
+trace_events = deque(maxlen=2000)
+ordered_today = set()
+order_date = None
+trade_counter = 0
+_state_lock = threading.Lock()
+
+stats = {
+    "received": 0, "parsed": 0, "oi_data_success": 0, "condition_met": 0, "discarded": 0,
+    "test_signals": 0, "orders": 0, "errors": 0, "spot_signals": 0, "option_signals": 0,
+    "telegram_sent": 0,
 }
 
-TF_LABEL = {"1": "1m", "3": "3m", "5": "5m", "15": "15m", "30": "30m",
-            "60": "1H", "240": "4H", "D": "1D", "W": "1W", "M": "1M"}
-
-V3_BASE = "https://api.upstox.com/v3/historical-candle"
-
-
-def normalize_tf(raw):
-    x = str(raw or "").strip().upper()
-    m = re.fullmatch(r"(\d+)([HDWM]?)", x)
-    if m:
-        n, suf = int(m.group(1)), m.group(2)
-        if suf == "":
-            x = str(n)
-        elif suf == "H":
-            x = str(n * 60)
-        elif suf == "D":
-            x = "D"
-        elif suf == "W":
-            x = "W"
-        elif suf == "M":
-            x = "M" if n == 1 else str(n)   # TradingView: "1M" = month
-    elif x in ("D", "W", "M"):
-        pass
-    return x if x in TF_SPEC else "15"
+# ============================================================
+# HELPERS
+# ============================================================
+def ist_now_str():
+    return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def parse_timeframe(raw_text):
-    """Reads  TF=15  /  TF:60  /  TF=D  from the alert text."""
-    m = re.search(r"\bTF\s*[=:]\s*([0-9]+[A-Za-z]?|[A-Za-z])\b", raw_text or "", re.I)
-    return normalize_tf(m.group(1)) if m else "15"
+def clean_symbol(value):
+    return str(value or "").strip().strip('"').strip("'").upper()
 
 
-# ------------------------------------------------------------------
-# Candle fetch
-# ------------------------------------------------------------------
-def fetch_candles(instrument_key, tf, headers):
-    unit, interval, days = TF_SPEC[tf]
-    to_d = datetime.now(IST).date()
-    fr = to_d - timedelta(days=days)
-    ek = quote(instrument_key, safe="")
-    urls = [f"{V3_BASE}/{ek}/{unit}/{interval}/{to_d}/{fr}"]
-    if unit in ("minutes", "hours"):                 # add today's live candles
-        urls.append(f"{V3_BASE}/intraday/{ek}/{unit}/{interval}")
+def reset_order_day():
+    global order_date, trade_counter
+    today = datetime.now(IST).date()
+    if order_date != today:
+        ordered_today.clear()
+        order_date = today
+        trade_counter = 0
 
-    rows = {}
-    for u in urls:
+
+def trace(signal_id, symbol, stage, status, message="", detail=None):
+    detail = detail or {}
+    trace_events.appendleft({
+        "time": ist_now_str(), "signal_id": signal_id, "symbol": symbol, "stage": stage,
+        "status": status, "message": message,
+        "spot_ltp": detail.get("spot_ltp", "N/A"),
+        "option_symbol": detail.get("option_symbol", "N/A"),
+        "strike": detail.get("strike", "N/A"),
+        "option_ltp": detail.get("option_ltp", "N/A"),
+        "oi_change_pct": detail.get("oi_change_pct", "N/A"),
+        "detail": detail,
+    })
+    log.info("[%s] [%s] %s | %s | %s", ist_now_str(), signal_id, stage, status, message)
+
+
+def is_market_open():
+    now = datetime.now(IST)
+    if now.weekday() >= 5:
+        return False
+    start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    return start <= now <= end
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+def _send_telegram_worker(text, bot_token, chat_id):
+    if not bot_token or not chat_id:
+        log.error("Telegram cancelled: Bot Token or Chat ID missing")
+        return
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+               "disable_web_page_preview": True}
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code == 200:
+            log.info("Telegram notification delivered")
+        else:
+            log.error("Telegram API error (HTTP %s): %s", resp.status_code, resp.text)
+    except Exception as exc:
+        log.error("Telegram exception: %s", exc)
+
+
+def notify_telegram(text):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN).strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID).strip()
+    stats["telegram_sent"] += 1
+    threading.Thread(target=_send_telegram_worker, args=(text, token, chat_id), daemon=True).start()
+
+
+# ============================================================
+# GREEKS + STATUS FLAG
+# ============================================================
+def calculate_estimated_greeks(spot_ltp, strike, option_type, days_to_expiry=5, iv=0.25):
+    try:
+        if not spot_ltp or not strike or spot_ltp == "N/A" or strike == "N/A":
+            return "N/A", "N/A", "N/A", "N/A"
+        spot_ltp, strike = float(spot_ltp), float(strike)
+        t = max(days_to_expiry, 1) / 365.0
+        r = 0.07
+        d1 = (math.log(spot_ltp / strike) + (r + 0.5 * iv ** 2) * t) / (iv * math.sqrt(t))
+        cdf = lambda x: 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+        pdf = lambda x: (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * x ** 2)
+        delta = cdf(d1) if option_type in ("CE", "CALL", "C") else cdf(d1) - 1.0
+        vega = (spot_ltp * pdf(d1) * math.sqrt(t)) / 100.0
+        theta = -((spot_ltp * pdf(d1) * iv) / (2 * math.sqrt(t))) / 365.0
+        return round(delta, 2), round(theta, 2), round(vega, 2), f"{round(iv * 100, 2)}%"
+    except Exception:
+        return "N/A", "N/A", "N/A", "N/A"
+
+
+def get_status_flag(opp_decay_val, otm1_decay_val, otm2_decay_val):
+    def parse_val(val):
+        if val in ("N/A", None, ""):
+            return None
         try:
-            r = requests.get(u, headers=headers, timeout=6)
-            if r.status_code == 200:
-                for c in (r.json().get("data") or {}).get("candles", []):
-                    rows[c[0]] = c
+            return float(str(val).replace("%", "").strip())
+        except ValueError:
+            return None
+
+    opp, otm1, otm2 = parse_val(opp_decay_val), parse_val(otm1_decay_val), parse_val(otm2_decay_val)
+    if opp is None:
+        return ""
+    if opp < 0:
+        return "🔴 "
+    if opp > 0 and otm1 is not None and otm2 is not None:
+        if otm1 < 0 and otm2 < 0:
+            return "🟢 "
+        if otm1 < 0 and otm2 > 0:
+            return "🟠 "
+        if otm1 > 0 and otm2 > 0:
+            return "🟡 "
+    return ""
+
+
+# ============================================================
+# INSTRUMENT MASTER LOADER
+# ============================================================
+def parse_expiry(raw):
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d-%b-%Y", "%Y%m%d"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    try:
+        return datetime.fromtimestamp(int(raw) / 1000, IST).date()
+    except Exception:
+        return None
+
+
+def _first_present(row, *keys):
+    for k in keys:
+        v = row.get(k)
+        if v not in (None, ""):
+            return v
+    return ""
+
+
+def load_rows(path):
+    if not os.path.exists(path):
+        log.warning("Master file missing: %s", path)
+        return
+    try:
+        if path.lower().endswith(".json.gz"):
+            with gzip.open(path, "rt", encoding="utf-8") as f:
+                data = json.load(f)
+        elif path.lower().endswith(".json"):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            log.error("Unsupported master file type: %s", path)
+            return
+        for row in data:
+            yield {str(k): ("" if v is None else str(v)).strip() for k, v in row.items()}
+    except Exception as exc:
+        log.error("Failed loading master file: %s", exc)
+
+
+def load_maps():
+    global equity_map, spot_map, options_map, symbol_to_option_map
+    equity_map, spot_map, options_map, symbol_to_option_map = {}, {}, {}, {}
+
+    for row in load_rows(INSTRUMENT_MASTER_PATH):
+        key = str(_first_present(row, "instrument_key")).strip()
+        if not key:
+            continue
+        segment = clean_symbol(_first_present(row, "segment"))
+        instrument_type = clean_symbol(_first_present(row, "instrument_type"))
+        trading_symbol = clean_symbol(_first_present(row, "trading_symbol", "tradingsymbol"))
+        trading_symbol_tv = clean_symbol(_first_present(row, "TV Symbol"))
+
+        if segment == "NSE_EQ" and instrument_type == "EQ" and trading_symbol:
+            record = {"instrument_key": key, "trading_symbol": trading_symbol, "segment": segment}
+            equity_map[trading_symbol] = record
+            spot_map[trading_symbol] = record
+            continue
+
+        if segment in ("NSE_FO", "NSE_FNO") and instrument_type in ("CE", "PE"):
+            underlying = clean_symbol(_first_present(row, "underlying_symbol", "asset_symbol", "name"))
+            if not underlying:
+                continue
+            try:
+                strike = float(_first_present(row, "strike_price", "strike"))
+            except (TypeError, ValueError):
+                continue
+            rec = {
+                "expiry": parse_expiry(_first_present(row, "expiry")),
+                "strike": strike,
+                "option_type": instrument_type,
+                "instrument_key": key,
+                "tradingsymbol": trading_symbol,
+                "lot_size": _first_present(row, "lot_size") or "1",
+                "underlying_symbol": underlying,
+                "underlying_key": str(_first_present(row, "underlying_key", "asset_key")).strip(),
+                "name": underlying,
+            }
+            options_map.setdefault(underlying, []).append(rec)
+            if trading_symbol:
+                symbol_to_option_map[trading_symbol] = rec
+            if trading_symbol_tv:
+                symbol_to_option_map[trading_symbol_tv] = rec
+
+    log.info("Master loaded -> option chains: %d | direct option symbols: %d",
+             len(options_map), len(symbol_to_option_map))
+
+
+load_maps()
+
+# ============================================================
+# SYMBOL TYPE IDENTIFICATION
+# ============================================================
+OPTION_PATTERN_ANY = re.compile(r"\b([A-Z&\-]+)(\d{6})(CE|PE|C|P)(\d+(?:\.\d+)?)\b", re.I)
+
+OPTION_PATTERN_STRIKE_BEFORE_TYPE = re.compile(
+    r"\b([A-Z0-9&\-]+?)(\d{2}(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC))"
+    r"(\d+(?:\.\d+)?)(CE|PE|C|P)\b", re.I)
+
+SPOT_SIGNAL_PATTERN = re.compile(
+    r"^\s*([A-Za-z0-9&\-]+).*?\b(Cross\s*over|Crossover|Break\s*out|Breakout|BO|"
+    r"Cross\s*under|Crossunder|Break\s*down|Breakdown|BD)\b", re.I)
+
+CE_SIGNALS = {"crossover", "cross over", "breakout", "break out", "bo"}
+PE_SIGNALS = {"crossunder", "cross under", "breakdown", "break down", "bd"}
+
+
+def identify_symbol_type(raw_text):
+    """Returns (mode, symbol, extra). Modes: OPTION_SYMBOL | SPOT_SIGNAL | UNKNOWN."""
+    clean_txt = clean_symbol(raw_text)
+
+    m = OPTION_PATTERN_ANY.search(clean_txt)
+    if m:
+        underlying, expiry_raw, ot, strike = m.group(1).upper(), m.group(2), m.group(3).upper(), m.group(4)
+        ot = {"C": "CE", "P": "PE"}.get(ot, ot)
+        log.info("OPTION DETECTED | %s | %s %s %s %s", m.group(0).upper(), underlying, expiry_raw, ot, strike)
+        return "OPTION_SYMBOL", m.group(0).upper(), (underlying, expiry_raw, ot, strike)
+
+    m = OPTION_PATTERN_STRIKE_BEFORE_TYPE.search(clean_txt)
+    if m:
+        underlying, expiry_raw, strike, ot = m.groups()
+        ot = {"C": "CE", "P": "PE"}.get(ot.upper(), ot.upper())
+        return "OPTION_SYMBOL", m.group(0).upper(), (underlying.upper(), expiry_raw.upper(), ot, strike)
+
+    m = SPOT_SIGNAL_PATTERN.search(raw_text or "")
+    if m:
+        symbol = clean_symbol(m.group(1))
+        sig = re.sub(r"\s+", " ", m.group(2)).strip().lower()
+        opt_type = "CE" if sig in CE_SIGNALS else "PE"
+        log.info("SPOT SIGNAL | %s | %s", symbol, opt_type)
+        return "SPOT_SIGNAL", symbol, opt_type
+
+    log.warning("SYMBOL PARSER UNKNOWN | %s", clean_txt)
+    return "UNKNOWN", clean_txt, "UNRECOGNIZED_FORMAT"
+
+
+# ============================================================
+# MARKET DATA
+# ============================================================
+def get_ltp(instrument_key):
+    try:
+        res = requests.get(UPSTOX_QUOTE_URL, headers=UPSTOX_HEADERS,
+                           params={"instrument_key": instrument_key}, timeout=5)
+        if res.status_code == 200:
+            payload = res.json().get("data", {})
+            if payload:
+                quote = list(payload.values())[0]
+                return float(quote.get("last_price", 0)), None
+        return None, f"HTTP_{res.status_code}"
+    except Exception as exc:
+        return None, str(exc)
+
+
+def get_option_candle_data(instrument_key):
+    url = f"{UPSTOX_CANDLE_URL}/{instrument_key}/1minute"
+    try:
+        res = requests.get(url, headers=UPSTOX_HEADERS, timeout=5)
+        if res.status_code == 200:
+            candles = res.json().get("data", {}).get("candles", [])
+            if len(candles) >= 2:
+                prev_low = float(candles[-2][3])
+                recent_high = float(candles[-1][2])
+                return prev_low, round(recent_high * 1.05, 2), float(candles[-1][6])
+    except Exception as exc:
+        log.warning("Candle fetch failed: %s", exc)
+    return "N/A", "N/A", None
+
+
+def get_upstox_oi_data(instrument_key):
+    try:
+        res = requests.get(UPSTOX_QUOTE_URL, headers=UPSTOX_HEADERS,
+                           params={"instrument_key": instrument_key}, timeout=5)
+        if res.status_code != 200:
+            return None, f"HTTP_{res.status_code}"
+        payload = res.json().get("data", {})
+        if not payload:
+            return None, "EMPTY_QUOTE_DATA"
+        q = list(payload.values())[0]
+        cur_oi = float(q.get("oi") or 0)
+        ltp = float(q.get("last_price") or 0)
+        oi_low = float(q.get("oi_day_low") or 0)
+        _, _, open_oi = get_option_candle_data(instrument_key)
+        base_oi = open_oi if (open_oi and open_oi > 0) else oi_low
+        if base_oi == 0:
+            return None, "BASE_OI_IS_ZERO"
+        pct = (cur_oi - base_oi) / base_oi * 100.0
+        return {"current_oi": cur_oi, "previous_oi": base_oi, "oi_change_pct": pct, "ltp": ltp}, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def select_otm_option(symbol, option_type, ltp):
+    chain = options_map.get(symbol, [])
+    if not chain:
+        return None, f"NO_OPTION_CHAIN_FOR_{symbol}"
+    today = datetime.now(IST).date()
+    same_type = [c for c in chain if c.get("option_type") == option_type
+                 and c.get("expiry") and c["expiry"] >= today]
+    if not same_type:
+        return None, f"NO_{option_type}_EXPIRIES"
+    nearest = min(c["expiry"] for c in same_type)
+    contracts = [c for c in same_type if c["expiry"] == nearest]
+    if option_type == "CE":
+        cands = sorted([c for c in contracts if float(c["strike"]) > ltp], key=lambda c: float(c["strike"]))
+    else:
+        cands = sorted([c for c in contracts if float(c["strike"]) < ltp],
+                       key=lambda c: float(c["strike"]), reverse=True)
+    if not cands:
+        return None, "NO_OTM_STRIKE_FOUND"
+    idx = OTM_LEVEL - 1
+    selected = dict(cands[idx if idx < len(cands) else 0])
+    selected["expiry_str"] = nearest.strftime("%Y-%m-%d")
+    return selected, None
+
+
+# ============================================================
+# OTM + OPPOSITE ANALYSIS
+# ============================================================
+def _decay_for(chain, strike, opt_type, expiry):
+    match = [c for c in chain if float(c.get("strike", 0)) == strike
+             and c.get("option_type") == opt_type and c.get("expiry") == expiry]
+    if match:
+        oi_data, _ = get_upstox_oi_data(match[0]["instrument_key"])
+        if oi_data:
+            return f"{oi_data['oi_change_pct']:.2f}%", str(oi_data["ltp"])
+    return "N/A", "N/A"
+
+
+def get_otm_symbols_and_decays(underlying, base_strike, opt_type, expiry):
+    chain = options_map.get(underlying, [])
+    try:
+        base_strike = float(base_strike)
+    except (TypeError, ValueError):
+        return ("N/A",) * 6
+    strikes = sorted({float(c["strike"]) for c in chain
+                      if c.get("option_type") == opt_type and c.get("expiry") == expiry})
+    is_call = opt_type in ("CE", "C")
+    if is_call:
+        otm = [s for s in strikes if s > base_strike]
+    else:
+        otm = sorted([s for s in strikes if s < base_strike], reverse=True)
+    step = INDEX_STEP_MAP.get(underlying, 20)
+    sign = 1 if is_call else -1
+    otm1 = otm[0] if len(otm) > 0 else base_strike + sign * step
+    otm2 = otm[1] if len(otm) > 1 else base_strike + sign * 2 * step
+    d1, l1 = _decay_for(chain, otm1, opt_type, expiry)
+    d2, l2 = _decay_for(chain, otm2, opt_type, expiry)
+    return otm1, d1, l1, otm2, d2, l2
+
+
+def get_opposite_decay(underlying, base_strike, current_opt_type, expiry):
+    opp = "PE" if current_opt_type in ("CE", "C") else "CE"
+    try:
+        base_strike = float(base_strike)
+    except (TypeError, ValueError):
+        return "N/A", "N/A"
+    return _decay_for(options_map.get(underlying, []), base_strike, opp, expiry)
+
+
+# ============================================================
+# TELEGRAM MESSAGE FORMATTER
+# ============================================================
+def format_telegram_message(is_spot_mode, trade_num, symbol, strike, option_type, spot_ltp,
+                            option_ltp, oi_change_pct, otm1_stk, otm1_decay, otm1_ltp,
+                            otm2_stk, otm2_decay, otm2_ltp, opp_symbol, opp_decay, opp_ltp,
+                            alert_time, prev_low="N/A", target="N/A", expiry_str="N/A"):
+    flag = get_status_flag(opp_decay, otm1_decay, otm2_decay)
+    fmt_oi = f"{oi_change_pct:.2f}%" if isinstance(oi_change_pct, (int, float)) else "N/A"
+
+    if is_spot_mode:
+        delta, theta, vega, hv = calculate_estimated_greeks(spot_ltp, strike, option_type)
+        opp_t = "PE" if option_type in ("CE", "C") else "CE"
+        return (
+            f"🚨 <b>New Trade Spot Chart #{trade_num}</b>\n\n"
+            f"Alert Time : {alert_time}\nAlert Type : Trendline BO/BD/AAA\n"
+            f"Symbol Name : {symbol}\nStrike : {strike}\nOption Type : {option_type}\n"
+            f"Expiry : {expiry_str}\nOI Decay : {fmt_oi}\nLTP SPOT : {spot_ltp}\n"
+            f"LTP OPTION : {option_ltp}\nDelta : {delta}\nTheta : {theta}\nVEGA : {vega}\nHV : {hv}\n"
+            f"SL : LOW of Previous Candle Option Chart ({prev_low})\n"
+            f"TARGET : High or NEXT Pivot LEVEL ({target})\n\n"
+            f"ℹ️ {flag}<i><b>[JUST FYI]</b> Opposite {strike} {opp_t} OI Decay: <b>{opp_decay}</b>, "
+            f"OTM1: {otm1_stk}{option_type} - OI Decay {otm1_decay}, "
+            f"OTM2: {otm2_stk}{option_type} - OI Decay {otm2_decay}</i>"
+        )
+    return (
+        f"🚨 <b>New Trade Option Strike Alert #{trade_num}</b>\n\n"
+        f"Alert Time : {alert_time}\nAlert Type : EMA 5X50 Closed\nStrike : {symbol}\n"
+        f"OI Decay : {fmt_oi}\nLTP : {option_ltp}\n\n"
+        f"<b>OTM1</b> : {otm1_stk} | Decay: {otm1_decay} | LTP: {otm1_ltp}\n"
+        f"<b>OTM2</b> : {otm2_stk} | Decay: {otm2_decay} | LTP: {otm2_ltp}\n\n"
+        f"ℹ️ {flag}<i><b>[JUST FYI]</b> Opposite Strike: <b>{opp_symbol}</b> "
+        f"| Opp. OI Decay: <b>{opp_decay}</b> | Opp. LTP: <b>{opp_ltp}</b></i>"
+    )
+
+
+# ============================================================
+# ORDER EXECUTION
+# ============================================================
+def place_upstox_order(instrument_key, quantity, price=0, transaction_type="BUY", is_amo=False):
+    body = {
+        "quantity": int(quantity),
+        "product": "I",
+        "validity": "DAY",
+        "price": float(price) if is_amo else 0.0,
+        "tag": f"oigate{int(time.time())}"[:20],
+        "instrument_token": instrument_key,
+        "order_type": "LIMIT" if is_amo else "MARKET",
+        "transaction_type": transaction_type,
+        "disclosed_quantity": 0,
+        "trigger_price": 0,
+        "is_amo": is_amo,
+    }
+    return requests.post(UPSTOX_ORDER_PLACE_URL, headers=UPSTOX_HEADERS, json=body, timeout=10)
+
+
+# ============================================================
+# EXACT OPTION CONTRACT FINDER
+# ============================================================
+def find_option_contract(underlying, expiry_raw, opt_type_raw, strike_raw):
+    underlying = clean_symbol(underlying)
+    opt_type = "CE" if clean_symbol(opt_type_raw) in ("C", "CE") else "PE"
+    try:
+        target_strike = float(strike_raw)
+    except (TypeError, ValueError):
+        return None
+
+    webhook_expiry = None
+    exp = str(expiry_raw).upper()
+    try:
+        if re.fullmatch(r"\d{6}", exp):
+            webhook_expiry = datetime.strptime(exp, "%y%m%d").date()
+        elif re.fullmatch(r"\d{2}(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)", exp):
+            webhook_expiry = datetime.strptime(f"{exp}{datetime.now(IST).year}", "%d%b%Y").date()
+    except Exception:
+        pass
+
+    chain = options_map.get(underlying, [])
+    log.info("OPTION SEARCH | %s | exp=%s | %s | %s | chain=%d",
+             underlying, webhook_expiry, opt_type, target_strike, len(chain))
+
+    for c in chain:
+        try:
+            if float(c.get("strike", 0)) != target_strike:
+                continue
+            if clean_symbol(c.get("option_type")) != opt_type:
+                continue
+            if webhook_expiry is not None and c.get("expiry") != webhook_expiry:
+                continue
+            log.info("EXACT OPTION FOUND | %s | %s", c.get("tradingsymbol"), c.get("instrument_key"))
+            return c
         except Exception:
             continue
-    return sorted(rows.values(), key=lambda c: c[0])   # oldest -> newest
+    log.warning("OPTION NOT FOUND | %s | %s | %s | %s", underlying, expiry_raw, opt_type, target_strike)
+    return None
 
 
-# ------------------------------------------------------------------
-# Indicators (pure python)
-# ------------------------------------------------------------------
-def ema(vals, n):
-    out, e, k = [], None, 2.0 / (n + 1)
-    for i, v in enumerate(vals):
-        if i < n - 1:
-            out.append(None)
-            continue
-        e = sum(vals[:n]) / n if e is None else v * k + e * (1 - k)
-        out.append(e)
-    return out
+# ============================================================
+# WEBHOOK
+# ============================================================
+def _resolve_spot(underlying):
+    spot = equity_map.get(underlying) or spot_map.get(underlying)
+    if not spot and underlying in INDEX_SPOT_KEYS:
+        spot = {"instrument_key": INDEX_SPOT_KEYS[underlying]}
+    return spot
 
 
-def macd(closes, fast=12, slow=26, sig=9):
-    ef, es = ema(closes, fast), ema(closes, slow)
-    line = [a - b if a is not None and b is not None else None for a, b in zip(ef, es)]
-    start = next((i for i, v in enumerate(line) if v is not None), None)
-    signal = [None] * len(closes)
-    if start is not None:
-        signal[start:] = ema(line[start:], sig)
-    hist = [l - s if l is not None and s is not None else None for l, s in zip(line, signal)]
-    return line, signal, hist
+def process_webhook(raw_payload, signal_id, alert_time):
+    """Full signal pipeline. Returns (dict, http_status)."""
+    global trade_counter
 
+    mode, parsed_symbol, extra_data = identify_symbol_type(raw_payload)
+    log.info("WEBHOOK | %s | MODE=%s | SYMBOL=%s | EXTRA=%s", signal_id, mode, parsed_symbol, extra_data)
 
-def rsi(closes, n=14):
-    out = [None] * len(closes)
-    if len(closes) <= n:
-        return out
-    g = l = 0.0
-    for i in range(1, n + 1):
-        d = closes[i] - closes[i - 1]
-        g += max(d, 0)
-        l += max(-d, 0)
-    ag, al = g / n, l / n
-    out[n] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
-    for i in range(n + 1, len(closes)):
-        d = closes[i] - closes[i - 1]
-        ag = (ag * (n - 1) + max(d, 0)) / n
-        al = (al * (n - 1) + max(-d, 0)) / n
-        out[i] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
-    return out
+    if mode == "UNKNOWN":
+        stats["errors"] += 1
+        trace(signal_id, raw_payload[:60], "PARSER", "FAILED", extra_data)
+        return {"status": "error", "reason": extra_data}, 400
 
+    stats["parsed"] += 1
+    stats["option_signals" if mode == "OPTION_SYMBOL" else "spot_signals"] += 1
 
-def pivots(series, kind, left=3, right=3):
-    idx = []
-    for i in range(left, len(series) - right):
-        w = series[i - left:i + right + 1]
-        if any(x is None for x in w):
-            continue
-        v = series[i]
-        if (kind == "low" and v == min(w)) or (kind == "high" and v == max(w)):
-            idx.append(i)
-    return idx
+    option_info = None
+    spot = None
+    spot_ltp = "N/A"
 
+    # ---------------- OPTION SYMBOL MODE ----------------
+    if mode == "OPTION_SYMBOL":
+        option_info = symbol_to_option_map.get(parsed_symbol)
+        if not option_info and isinstance(extra_data, tuple):
+            option_info = find_option_contract(*extra_data)
 
-def divergence(lows, highs, ind, lookback=80, recent=20):
-    """Regular divergence between price swings and an indicator."""
-    n = len(ind)
-    start = max(0, n - lookback)
-    res = "None"
-    pl = [i for i in pivots(lows, "low") if i >= start]
-    if len(pl) >= 2:
-        a, b = pl[-2], pl[-1]
-        if (n - 1 - b <= recent and ind[a] is not None and ind[b] is not None
-                and lows[b] < lows[a] and ind[b] > ind[a]):
-            res = "Bullish"
-    ph = [i for i in pivots(highs, "high") if i >= start]
-    if len(ph) >= 2:
-        a, b = ph[-2], ph[-1]
-        if (n - 1 - b <= recent and ind[a] is not None and ind[b] is not None
-                and highs[b] > highs[a] and ind[b] < ind[a]):
-            res = "Bearish" if res == "None" else "Both"
-    return res
+        if not option_info:
+            stats["discarded"] += 1
+            trace(signal_id, parsed_symbol, "OPTION_LOOKUP", "FAILED", "Option Symbol not found in Master")
+            return {"status": "discarded", "reason": "option_symbol_not_found"}, 200
 
+        underlying = option_info.get("name") or option_info.get("underlying_symbol")
+        spot = _resolve_spot(underlying)
+        if spot:
+            s_ltp, _ = get_ltp(spot["instrument_key"])
+            if s_ltp is not None:
+                spot_ltp = s_ltp
 
-# ------------------------------------------------------------------
-# Single timeframe analysis
-# ------------------------------------------------------------------
-def _sgn(x):
-    return 1 if x > 0 else -1 if x < 0 else 0
-
-
-def analyze_tf(instrument_key, tf, headers):
-    out = {"tf": tf, "label": TF_LABEL.get(tf, tf)}
-    candles = fetch_candles(instrument_key, tf, headers)
-    if len(candles) < 55:
-        out["error"] = f"Only {len(candles)} candles returned (need 55+)"
-        return out
-
-    closes = [float(c[4]) for c in candles]
-    highs = [float(c[2]) for c in candles]
-    lows = [float(c[3]) for c in candles]
-    px = closes[-1]
-
-    # ---- EMA 20 / 50
-    e20, e50 = ema(closes, 20), ema(closes, 50)
-    state = "PCO" if e20[-1] > e50[-1] else "NCO"
-    bars = 0
-    for i in range(len(closes) - 1, -1, -1):
-        if e20[i] is None or e50[i] is None or (e20[i] > e50[i]) != (state == "PCO"):
-            break
-        bars += 1
-    if px > e20[-1] and px > e50[-1]:
-        pstat, ptone = "Above 20 & 50", 1
-    elif px < e20[-1] and px < e50[-1]:
-        pstat, ptone = "Below 20 & 50", -1
-    elif px > e50[-1]:
-        pstat, ptone = "Above 50, below 20", 0
+    # ---------------- SPOT SIGNAL MODE ----------------
     else:
-        pstat, ptone = "Above 20, below 50", 0
+        underlying, opt_type = parsed_symbol, extra_data
+        spot = _resolve_spot(underlying)
+        if not spot:
+            stats["discarded"] += 1
+            trace(signal_id, underlying, "SPOT_LOOKUP", "FAILED", "Spot Symbol not in Master")
+            return {"status": "discarded", "reason": "spot_not_found"}, 200
 
-    # ---- MACD
-    ml, ms, mh = macd(closes)
-    bias_up = ml[-1] > ms[-1]
-    above0 = ml[-1] > 0
-    tick_up = ml[-1] > ml[-2]
-    hist_up = mh[-1] > mh[-2]
-    if bias_up and above0:
-        mbias = "Strong Bullish"
-    elif bias_up:
-        mbias = "Bullish (below zero)"
-    elif not above0:
-        mbias = "Strong Bearish"
-    else:
-        mbias = "Bearish (above zero)"
+        spot_ltp, err = get_ltp(spot["instrument_key"])
+        if spot_ltp is None:
+            stats["errors"] += 1
+            trace(signal_id, underlying, "SPOT_LTP", "FAILED", err)
+            return {"status": "error", "reason": "spot_ltp_failed"}, 200
 
-    # ---- RSI
-    rs = rsi(closes)
-    rv = rs[-1]
-    rtick_up = rv > rs[-2]
-    zone = ("Overbought" if rv >= 70 else "Bullish" if rv >= 60 else "Neutral" if rv >= 40
-            else "Bearish" if rv > 30 else "Oversold")
+        option_info, err = select_otm_option(underlying, opt_type, spot_ltp)
+        if not option_info:
+            stats["discarded"] += 1
+            trace(signal_id, underlying, "OTM_SELECTION", "FAILED", err)
+            return {"status": "discarded", "reason": err}, 200
 
-    # ---- Divergence
-    d_rsi = divergence(lows, highs, rs)
-    d_macd = divergence(lows, highs, mh)
-    dtxt = "None"
-    if "Bullish" in (d_rsi, d_macd) and "Bearish" not in (d_rsi, d_macd):
-        dtxt = "Bullish"
-    elif "Bearish" in (d_rsi, d_macd) and "Bullish" not in (d_rsi, d_macd):
-        dtxt = "Bearish"
-    elif d_rsi != "None" or d_macd != "None":
-        dtxt = "Mixed"
-    dtone = {"Bullish": 1, "Bearish": -1}.get(dtxt, 0)
+    # ---------------- MULTI-TIMEFRAME SPOT ANALYSIS ----------------
+    signal_tf = analysis.parse_timeframe(raw_payload)
+    direction = "BULL" if option_info.get("option_type", "CE") == "CE" else "BEAR"
+    spot_key = spot["instrument_key"] if spot else None
+    mtf = None
+    if spot_key:
+        try:
+            mtf = analysis.run_mtf_analysis(
+                spot_key, signal_tf, direction, UPSTOX_HEADERS,
+                meta={
+                    "underlying": option_info.get("name") or option_info.get("underlying_symbol"),
+                    "option_symbol": option_info.get("tradingsymbol"),
+                    "alert_time": alert_time,
+                },
+            )
+            analysis.save_analysis(signal_id, mtf)
+        except Exception as exc:
+            log.error("MTF analysis failed: %s", exc)
 
-    # ---- Scoring (6 factors, -100..+100)
-    pts = [ptone, 1 if state == "PCO" else -1, 1 if bias_up else -1,
-           1 if tick_up else -1, _sgn(rv - 50), dtone]
-    score = round(sum(pts) / 6 * 100)
+    # ---------------- OI DECAY ANALYSIS ----------------
+    oi_data, err = get_upstox_oi_data(option_info["instrument_key"])
+    if not oi_data:
+        stats["errors"] += 1
+        trace(signal_id, parsed_symbol, "OI_FETCH", "FAILED", err,
+              detail={"has_analysis": bool(mtf)})
+        return {"status": "error", "reason": "oi_fetch_failed"}, 200
 
-    # ---- Narrative
-    notes = []
-    if bars <= 3:
-        notes.append(f"Fresh EMA20/50 {state} - formed {bars} bar(s) ago.")
-    if bias_up != tick_up:
-        notes.append("MACD bias and tick disagree - momentum may be turning.")
-    if rv >= 70:
-        notes.append("RSI overbought - chasing risk.")
-    elif rv <= 30:
-        notes.append("RSI oversold - bounce risk for shorts.")
-    if dtxt in ("Bullish", "Bearish"):
-        notes.append(f"{dtxt} divergence on spot (RSI: {d_rsi}, MACD hist: {d_macd}).")
-    if ptone == 0:
-        notes.append("Price is trapped between EMA20 and EMA50 - no clean trend.")
+    stats["oi_data_success"] += 1
+    pct = oi_data["oi_change_pct"]
+    option_ltp = oi_data["ltp"]
 
-    rows = [
-        {"k": "Price vs EMA", "v": pstat, "t": ptone,
-         "sub": f"Close {px:.2f} | EMA20 {e20[-1]:.2f} | EMA50 {e50[-1]:.2f}"},
-        {"k": "EMA 20/50", "v": f"{state}", "t": 1 if state == "PCO" else -1,
-         "sub": f"{'Positive' if state == 'PCO' else 'Negative'} crossover state, {bars} bars"},
-        {"k": "MACD bias", "v": mbias, "t": 1 if bias_up else -1,
-         "sub": f"Line {ml[-1]:.2f} | Signal {ms[-1]:.2f} | Hist {mh[-1]:.2f}"},
-        {"k": "MACD tick", "v": "Up tick" if tick_up else "Down tick", "t": 1 if tick_up else -1,
-         "sub": f"Line {ml[-1]:.2f} vs prev {ml[-2]:.2f} | Hist {'rising' if hist_up else 'falling'}"},
-        {"k": "RSI 14", "v": f"{rv:.1f} {zone}", "t": _sgn(rv - 50),
-         "sub": f"{'Rising' if rtick_up else 'Falling'} (prev {rs[-2]:.1f})"},
-        {"k": "Divergence", "v": dtxt, "t": dtone,
-         "sub": f"RSI: {d_rsi} | MACD: {d_macd}"},
-    ]
-
-    out.update({
-        "bars": len(candles), "close": px, "last_candle": candles[-1][0][:16].replace("T", " "),
-        "ema20": round(e20[-1], 2), "ema50": round(e50[-1], 2), "cross_state": state,
-        "bars_since_cross": bars, "macd_line": round(ml[-1], 3), "macd_signal": round(ms[-1], 3),
-        "macd_hist": round(mh[-1], 3), "macd_tick": "UP" if tick_up else "DOWN",
-        "macd_bias": mbias, "rsi": round(rv, 1), "rsi_zone": zone,
-        "price_status": pstat, "divergence": dtxt,
-        "score": score, "rows": rows, "notes": notes,
-    })
-    return out
-
-
-# ------------------------------------------------------------------
-# Full MTF run + storage
-# ------------------------------------------------------------------
-_STORE = OrderedDict()
-_LOCK = threading.Lock()
-_MAX = 300
-
-
-def run_mtf_analysis(spot_key, signal_tf, direction, headers, meta=None):
-    """direction: 'BULL' (CE) or 'BEAR' (PE)."""
-    signal_tf = normalize_tf(signal_tf)
-    tfs = [signal_tf] + [t for t in HTF_MAP.get(signal_tf, ()) if t != signal_tf]
-    with ThreadPoolExecutor(max_workers=len(tfs)) as ex:
-        results = list(ex.map(lambda t: analyze_tf(spot_key, t, headers), tfs))
-    for r, role in zip(results, ["Signal TF", "HTF 1", "HTF 2"]):
-        r["role"] = role
-
-    d = 1 if direction == "BULL" else -1
-    weights = [1.0, 1.5, 2.0]
-    good = [(r, w) for r, w in zip(results, weights) if "error" not in r]
-    if good:
-        align = round(sum(r["score"] * d * w for r, w in good) / sum(w for _, w in good))
-    else:
-        align = 0
-    verdict = ("STRONG ALIGNMENT" if align >= 60 else "MODERATE ALIGNMENT" if align >= 25
-               else "MIXED / NEUTRAL" if align > -25 else "AGAINST TRADE")
-
-    data = {
-        "signal_tf": signal_tf, "signal_tf_label": TF_LABEL[signal_tf],
-        "direction": direction, "alignment": align, "verdict": verdict,
-        "timeframes": results,
-        "generated_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
-        "spot_key": spot_key, "meta": meta or {},
+    log_detail = {
+        "spot_ltp": str(spot_ltp),
+        "strike": str(option_info.get("strike", "N/A")),
+        "option_symbol": str(option_info.get("tradingsymbol", "N/A")),
+        "option_ltp": str(option_ltp),
+        "oi_change_pct": f"{pct:.2f}%",
+        "underlying": str(option_info.get("name") or option_info.get("underlying_symbol", "")),
+        "opt_type": str(option_info.get("option_type", "")),
+        "expiry": str(option_info.get("expiry") or ""),
+        "instrument_key": str(option_info.get("instrument_key", "")),
+        "lot_size": str(option_info.get("lot_size", "1")),
+        "tradingsymbol": str(option_info.get("tradingsymbol", "")),
+        "has_analysis": bool(mtf),
     }
-    return data
+
+    # ---------------- OI THRESHOLD ----------------
+    if pct > OI_DROP_THRESHOLD:
+        stats["discarded"] += 1
+        trace(signal_id, parsed_symbol, "OI_CHECK", "DISCARDED",
+              f"OI Change {pct:.2f}% didn't meet threshold {OI_DROP_THRESHOLD}%", detail=log_detail)
+        return {"status": "discarded", "reason": "oi_threshold_not_met"}, 200
+
+    stats["condition_met"] += 1
+    with _state_lock:
+        trade_counter += 1
+        trade_num = trade_counter
+
+    underlying = option_info.get("name") or option_info.get("underlying_symbol", "N/A")
+    base_strike = option_info.get("strike", "N/A")
+    opt_type = option_info.get("option_type", "CE")
+    expiry = option_info.get("expiry")
+
+    otm1_stk, otm1_decay, otm1_ltp, otm2_stk, otm2_decay, otm2_ltp = get_otm_symbols_and_decays(
+        underlying, base_strike, opt_type, expiry)
+    opp_decay, opp_ltp = get_opposite_decay(underlying, base_strike, opt_type, expiry)
+    prev_low, target, _ = get_option_candle_data(option_info["instrument_key"])
+
+    tg_text = format_telegram_message(
+        is_spot_mode=(mode == "SPOT_SIGNAL"), trade_num=trade_num, symbol=parsed_symbol,
+        strike=base_strike, option_type=opt_type, spot_ltp=spot_ltp, option_ltp=option_ltp,
+        oi_change_pct=pct, otm1_stk=otm1_stk, otm1_decay=otm1_decay, otm1_ltp=otm1_ltp,
+        otm2_stk=otm2_stk, otm2_decay=otm2_decay, otm2_ltp=otm2_ltp,
+        opp_symbol=f"{base_strike}{'PE' if opt_type in ('CE', 'C') else 'CE'}",
+        opp_decay=opp_decay, opp_ltp=opp_ltp, alert_time=alert_time,
+        prev_low=prev_low, target=target,
+        expiry_str=option_info.get("expiry_str", str(expiry or "N/A")),
+    )
+    link = f"{PUBLIC_BASE_URL}/analysis/{signal_id}" if PUBLIC_BASE_URL else None
+    tg_text += "\n" + analysis.telegram_block(mtf, link)
+    notify_telegram(tg_text)
+
+    # ---------------- ORDER ----------------
+    quantity = DEFAULT_QUANTITY or option_info.get("lot_size", "1")
+    tradingsymbol = option_info["tradingsymbol"]
+    is_amo = not is_market_open()
+
+    if TEST_MODE:
+        stats["test_signals"] += 1
+        trace(signal_id, parsed_symbol, "ORDER", "TEST_MODE",
+              f"Simulated order for {tradingsymbol} x {quantity}", detail=log_detail)
+        return {"status": "test_signal_simulated", "symbol": tradingsymbol}, 200
+
+    if tradingsymbol in ordered_today:
+        stats["discarded"] += 1
+        trace(signal_id, parsed_symbol, "ORDER", "BLOCKED", "Duplicate signal today", detail=log_detail)
+        return {"status": "discarded", "reason": "duplicate"}, 200
+
+    resp = place_upstox_order(option_info["instrument_key"], quantity, price=option_ltp,
+                              transaction_type="BUY", is_amo=is_amo)
+    if resp.status_code in (200, 201):
+        ordered_today.add(tradingsymbol)
+        stats["orders"] += 1
+        trace(signal_id, parsed_symbol, "ORDER", "SUCCESS", f"Placed for {tradingsymbol}", detail=log_detail)
+        return {"status": "order_placed", "response": resp.json()}, 200
+
+    stats["errors"] += 1
+    trace(signal_id, parsed_symbol, "ORDER", "FAILED", resp.text, detail=log_detail)
+    return {"status": "error", "reason": "order_execution_failed"}, 500
 
 
-def save_analysis(signal_id, data):
-    with _LOCK:
-        _STORE[signal_id] = data
-        while len(_STORE) > _MAX:
-            _STORE.popitem(last=False)
+def _safe_process(raw_payload, signal_id, alert_time):
+    try:
+        process_webhook(raw_payload, signal_id, alert_time)
+    except Exception as exc:
+        stats["errors"] += 1
+        log.exception("Webhook processing crashed")
+        trace(signal_id, raw_payload[:60], "PIPELINE", "FAILED", str(exc))
 
 
-def get_analysis(signal_id):
-    with _LOCK:
-        return _STORE.get(signal_id)
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    if WEBHOOK_SECRET and request.args.get("key") != WEBHOOK_SECRET:
+        return jsonify({"status": "error", "reason": "unauthorized"}), 401
+
+    reset_order_day()
+    stats["received"] += 1
+    signal_id = f"SIG-{int(time.time() * 1000)}"
+    alert_time = ist_now_str()
+    raw_payload = request.get_data(as_text=True)
+
+    if ASYNC_WEBHOOK:
+        threading.Thread(target=_safe_process, args=(raw_payload, signal_id, alert_time),
+                         daemon=True).start()
+        return jsonify({"status": "accepted", "signal_id": signal_id}), 200
+
+    result, code = process_webhook(raw_payload, signal_id, alert_time)
+    return jsonify(result), code
 
 
-def refresh_analysis(signal_id, headers):
-    old = get_analysis(signal_id)
-    if not old:
-        return None
-    new = run_mtf_analysis(old["spot_key"], old["signal_tf"], old["direction"], headers, old["meta"])
-    save_analysis(signal_id, new)
-    return new
+# ============================================================
+# API
+# ============================================================
+@app.route("/api/logs")
+def api_logs():
+    return jsonify(list(trace_events))
 
 
-def telegram_block(a, link=None):
-    if not a:
-        return ""
-    arrow = {"UP": "⬆", "DOWN": "⬇"}
-    lines = ["", f"📊 <b>MTF Analysis</b> | {a['verdict']} ({a['alignment']:+d}%)"]
-    for t in a["timeframes"]:
-        if "error" in t:
-            lines.append(f"<b>{t['label']}</b>: data unavailable")
-            continue
-        lines.append(
-            f"<b>{t['label']}</b> | {t['cross_state']} | {t['price_status']} | "
-            f"MACD {t['macd_bias']} {arrow[t['macd_tick']]} | RSI {t['rsi']:.0f} | Div: {t['divergence']}"
-        )
-    if link:
-        lines.append(f'<a href="{link}">Open full analysis</a>')
-    return "\n".join(lines)
+@app.route("/api/stats")
+def api_stats():
+    return jsonify(stats)
 
 
-# ------------------------------------------------------------------
-# Full-window analysis page
-# ------------------------------------------------------------------
-ANALYSIS_HTML = r"""<!DOCTYPE html>
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "options_loaded": len(options_map), "time": ist_now_str()})
+
+
+@app.route("/api/analysis/<signal_id>")
+def api_analysis(signal_id):
+    if request.args.get("refresh"):
+        data = analysis.refresh_analysis(signal_id, UPSTOX_HEADERS)
+    else:
+        data = analysis.get_analysis(signal_id)
+    if not data:
+        return jsonify({"status": "error", "reason": "analysis_not_found"}), 404
+    return jsonify(data)
+
+
+@app.route("/analysis/<signal_id>")
+def analysis_page(signal_id):
+    return Response(analysis.ANALYSIS_HTML, mimetype="text/html")
+
+
+@app.route("/api/details/<signal_id>")
+def api_signal_details(signal_id):
+    item = next((ev for ev in trace_events
+                 if ev.get("signal_id") == signal_id and (ev.get("detail") or {}).get("instrument_key")), None)
+    if not item:
+        return jsonify({"status": "error", "reason": "signal_not_found"}), 404
+
+    detail = item["detail"]
+    instrument_key = detail["instrument_key"]
+    underlying = detail.get("underlying", "")
+    opt_type = detail.get("opt_type", "CE")
+    lot_size = detail.get("lot_size", "1")
+    tradingsymbol = detail.get("tradingsymbol", "")
+    try:
+        base_strike = float(detail.get("strike", 0))
+    except (TypeError, ValueError):
+        base_strike = 0.0
+    expiry = parse_expiry(detail.get("expiry", ""))
+
+    oi_data, _ = get_upstox_oi_data(instrument_key)
+    option_ltp = oi_data["ltp"] if oi_data else "N/A"
+    option_oi_pct = f"{oi_data['oi_change_pct']:.2f}%" if oi_data else "N/A"
+
+    spot_ltp = "N/A"
+    spot = _resolve_spot(underlying)
+    if spot:
+        s_ltp, _ = get_ltp(spot["instrument_key"])
+        if s_ltp is not None:
+            spot_ltp = s_ltp
+
+    otm1_stk, otm1_decay, _, otm2_stk, otm2_decay, _ = get_otm_symbols_and_decays(
+        underlying, base_strike, opt_type, expiry)
+    opp_decay, _ = get_opposite_decay(underlying, base_strike, opt_type, expiry)
+    opp_type = "PE" if opt_type in ("CE", "C") else "CE"
+
+    try:
+        estimated_cost = round(float(lot_size) * float(option_ltp), 2)
+    except (TypeError, ValueError):
+        estimated_cost = "N/A"
+
+    return jsonify({
+        "status": "ok", "signal_id": signal_id,
+        "symbol": tradingsymbol or item.get("symbol", "N/A"),
+        "underlying": underlying, "base_strike": base_strike, "opt_type": opt_type,
+        "spot_ltp": spot_ltp, "option_ltp": option_ltp, "option_oi_change_pct": option_oi_pct,
+        "lot_size": lot_size, "estimated_cost": estimated_cost,
+        "otm1_strike": otm1_stk, "otm1_decay": otm1_decay,
+        "otm2_strike": otm2_stk, "otm2_decay": otm2_decay,
+        "opposite_type": opp_type, "opposite_strike": base_strike, "opposite_decay": opp_decay,
+    })
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Signal analysis</title>
-<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;800&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>⚡ Unified OI Strategy Terminal</title>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{--bull:#00e676;--bear:#ff3b5c;--gold:#ffd54a;--cyan:#22e5ff;--purple:#a06bff;--ink:#e7ecff;--mute:#8d97bd;
---panel:rgba(16,21,38,.78);--line:rgba(120,140,255,.18);}
-*{box-sizing:border-box}
-body{margin:0;font-family:'Rajdhani',sans-serif;color:var(--ink);min-height:100vh;
-background:radial-gradient(900px 600px at 5% -10%,rgba(160,107,255,.25),transparent 60%),
-radial-gradient(900px 600px at 100% 0,rgba(34,229,255,.18),transparent 55%),#070914;}
-.wrap{max-width:1280px;margin:0 auto;padding:22px 20px 50px}
-.head{display:grid;grid-template-columns:1fr auto;gap:24px;align-items:center;background:var(--panel);
-border:1px solid var(--line);border-radius:18px;padding:22px 26px}
-.sym{font-family:'Orbitron';font-weight:800;font-size:1.7rem;letter-spacing:.5px}
-.sub{color:var(--mute);margin-top:4px;font-size:1rem}
-.chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
-.chip{padding:5px 12px;border-radius:999px;font-weight:700;font-size:.85rem;border:1px solid var(--line);background:rgba(255,255,255,.04)}
-.chip.bull{color:var(--bull);border-color:rgba(0,230,118,.45);background:rgba(0,230,118,.1)}
-.chip.bear{color:var(--bear);border-color:rgba(255,59,92,.45);background:rgba(255,59,92,.1)}
-.chip.neu{color:var(--gold);border-color:rgba(255,213,74,.45);background:rgba(255,213,74,.08)}
-.gauge{display:flex;align-items:center;gap:18px}
-.ring{width:150px;height:150px;border-radius:50%;display:grid;place-items:center;
-background:conic-gradient(var(--c) calc(var(--p)*1%),rgba(255,255,255,.08) 0)}
-.ring-in{width:120px;height:120px;border-radius:50%;background:#0a0d1a;display:flex;flex-direction:column;align-items:center;justify-content:center}
-.ring-in b{font-family:'Orbitron';font-size:1.6rem}
-.ring-in span{font-size:.72rem;color:var(--mute);letter-spacing:1px}
-.verdict{font-family:'Orbitron';font-weight:700;font-size:1.05rem;max-width:190px;line-height:1.35}
-h2{font-family:'Orbitron';font-size:1rem;margin:28px 0 12px;font-weight:700}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:6px 6px 8px;overflow-x:auto}
-table{width:100%;border-collapse:collapse;min-width:640px}
-th,td{padding:12px 14px;text-align:left;border-bottom:1px solid rgba(120,140,255,.09)}
-th{color:var(--mute);font-weight:600;font-size:.9rem}
-tr:last-child td{border-bottom:0}
-td.k{color:var(--mute);font-weight:600;white-space:nowrap}
-.cell{display:inline-flex;align-items:center;gap:7px;padding:4px 11px;border-radius:8px;font-weight:600;font-size:.95rem}
-.cell.bull{background:rgba(0,230,118,.12);color:var(--bull)}
-.cell.bear{background:rgba(255,59,92,.12);color:var(--bear)}
-.cell.neu{background:rgba(255,213,74,.1);color:var(--gold)}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px 18px 14px}
-.card-h{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px}
-.card-h b{font-family:'Orbitron';font-size:1.25rem}
-.card-h span{color:var(--mute);font-size:.85rem}
-.bar{height:7px;border-radius:5px;background:rgba(255,255,255,.07);position:relative;margin:10px 0 14px}
-.bar i{position:absolute;top:-3px;width:3px;height:13px;border-radius:2px;background:#fff;box-shadow:0 0 8px #fff}
-.bar::before{content:"";position:absolute;left:50%;top:0;bottom:0;width:1px;background:rgba(255,255,255,.3)}
-.bar u{position:absolute;top:0;bottom:0;border-radius:5px;text-decoration:none}
-.line{padding:9px 0;border-top:1px solid rgba(120,140,255,.09)}
-.line .r{display:flex;justify-content:space-between;gap:10px;align-items:center}
-.line .r span:first-child{color:var(--mute);font-weight:600}
-.line small{display:block;color:#6f7aa3;margin-top:3px;font-size:.82rem}
-.meter{height:8px;border-radius:5px;position:relative;margin:8px 0 2px;
-background:linear-gradient(90deg,var(--bull) 0 30%,rgba(255,255,255,.12) 30% 70%,var(--bear) 70% 100%)}
-.meter i{position:absolute;top:-4px;width:4px;height:16px;border-radius:2px;background:#fff;box-shadow:0 0 8px #fff}
-.notes{margin:12px 0 0;padding:10px 12px;border-radius:10px;background:rgba(160,107,255,.08);color:#cfd5f5;font-size:.92rem}
-.notes div+div{margin-top:4px}
-.oi{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
-.oi div{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
-.oi small{color:var(--mute);font-weight:600}
-.oi b{display:block;font-family:'Orbitron';font-size:1.1rem;margin-top:3px}
-.bull-t{color:var(--bull)}.bear-t{color:var(--bear)}
-button{background:rgba(34,229,255,.12);color:#dff6ff;border:1px solid rgba(34,229,255,.4);border-radius:9px;
-padding:7px 14px;font:700 .9rem 'Rajdhani';cursor:pointer}
-button:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
-.err{padding:60px 10px;text-align:center;color:var(--bear);font-size:1.1rem}
-@media(max-width:720px){.head{grid-template-columns:1fr}}
-</style></head><body><div class="wrap" id="app"><div class="err" style="color:var(--mute)">Loading analysis…</div></div>
+:root{--bull:#00e676;--bear:#ff3b5c;--gold:#ffd54a;--cyan:#22e5ff;--purple:#a06bff;--panel:rgba(15,20,35,.72);--panel-brd:rgba(120,140,255,.18);}
+*{box-sizing:border-box;}
+body{margin:0;font-family:'Rajdhani',sans-serif;color:#e7ecff;min-height:100vh;
+background:radial-gradient(1100px 700px at 8% -10%,rgba(160,107,255,.28),transparent 60%),radial-gradient(1000px 650px at 105% 0%,rgba(34,229,255,.22),transparent 55%),radial-gradient(900px 900px at 50% 120%,rgba(0,230,118,.18),transparent 55%),linear-gradient(180deg,#05060d,#0a0d1a 45%,#05060d);background-attachment:fixed;overflow-x:hidden;}
+.bg-grid{position:fixed;inset:0;z-index:-3;background-image:linear-gradient(rgba(120,140,255,.06) 1px,transparent 1px),linear-gradient(90deg,rgba(120,140,255,.06) 1px,transparent 1px);background-size:42px 42px;animation:gridDrift 30s linear infinite;mask-image:radial-gradient(circle at 50% 20%,black,transparent 85%);}
+@keyframes gridDrift{from{background-position:0 0,0 0;}to{background-position:400px 400px,400px 400px;}}
+.floaters{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden;}
+.floaters span{position:absolute;bottom:-10%;opacity:.10;animation:rise linear infinite;}
+@keyframes rise{0%{transform:translateY(0) rotate(0);opacity:0;}10%{opacity:.14;}90%{opacity:.10;}100%{transform:translateY(-115vh) rotate(20deg);opacity:0;}}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:18px 26px;margin-bottom:22px;background:linear-gradient(120deg,rgba(160,107,255,.14),rgba(34,229,255,.08));border:1px solid var(--panel-brd);border-radius:18px;backdrop-filter:blur(10px);box-shadow:0 10px 40px rgba(0,0,0,.35);}
+.brand{font-family:'Orbitron',sans-serif;font-weight:900;font-size:1.5rem;background:linear-gradient(90deg,var(--cyan),var(--purple) 50%,var(--bull));-webkit-background-clip:text;background-clip:text;color:transparent;}
+.brand small{display:block;font-family:'Rajdhani';font-weight:600;color:#9aa4c7;font-size:.78rem;letter-spacing:2px;}
+.live-pill{display:flex;align-items:center;gap:8px;background:rgba(0,230,118,.12);border:1px solid rgba(0,230,118,.45);color:var(--bull);padding:7px 16px;border-radius:999px;font-weight:700;font-size:.85rem;}
+.live-dot{width:9px;height:9px;border-radius:50%;background:var(--bull);animation:pulse 1.4s infinite;}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(0,230,118,.6);}70%{box-shadow:0 0 0 9px rgba(0,230,118,0);}100%{box-shadow:0 0 0 0 rgba(0,230,118,0);}}
+.container-fluid{max-width:1500px;margin:0 auto;padding:22px 22px 40px;}
+.stat-grid{display:grid;grid-template-columns:repeat(8,1fr);gap:14px;margin-bottom:24px;}
+@media(max-width:1400px){.stat-grid{grid-template-columns:repeat(4,1fr);}}
+@media(max-width:700px){.stat-grid{grid-template-columns:repeat(2,1fr);}}
+.stat-card{position:relative;overflow:hidden;background:var(--panel);border:1px solid var(--panel-brd);border-radius:16px;padding:16px 14px;backdrop-filter:blur(12px);transition:transform .25s,box-shadow .25s;}
+.stat-card:hover{transform:translateY(-4px);box-shadow:0 14px 34px rgba(34,229,255,.15);}
+.stat-card .icon{font-size:1.5rem;margin-bottom:6px;}
+.stat-card .label{font-size:.72rem;letter-spacing:1.2px;text-transform:uppercase;color:#9aa4c7;font-weight:600;}
+.stat-card .value{font-family:'Orbitron',sans-serif;font-size:1.7rem;font-weight:700;margin-top:2px;}
+.panel{background:var(--panel);border:1px solid var(--panel-brd);border-radius:18px;padding:20px;backdrop-filter:blur(12px);box-shadow:0 10px 40px rgba(0,0,0,.35);}
+.panel-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:16px;}
+.panel-title{font-family:'Orbitron',sans-serif;font-size:1.05rem;font-weight:700;color:#fff;}
+.search-wrap{position:relative;width:290px;max-width:60vw;}
+.search-wrap input{width:100%;background:rgba(255,255,255,.05);border:1px solid var(--panel-brd);color:#fff;padding:9px 14px 9px 36px;border-radius:10px;font-size:.9rem;outline:none;}
+.search-wrap input:focus{border-color:var(--cyan);box-shadow:0 0 0 3px rgba(34,229,255,.15);}
+.search-wrap .ico{position:absolute;left:12px;top:50%;transform:translateY(-50%);}
+.table-wrap{max-height:560px;overflow:auto;border-radius:12px;}
+table{width:100%;border-collapse:separate;border-spacing:0;font-size:.86rem;}
+thead th{position:sticky;top:0;z-index:2;background:rgba(20,25,45,.98);color:#9aa4c7;text-transform:uppercase;letter-spacing:.8px;font-size:.72rem;padding:12px 10px;border-bottom:1px solid var(--panel-brd);white-space:nowrap;text-align:left;}
+tbody td{padding:10px;border-bottom:1px solid rgba(120,140,255,.08);white-space:nowrap;color:#dbe1fb;}
+tbody tr:hover{background:rgba(120,140,255,.07);}
+tbody tr.row-success{box-shadow:inset 3px 0 0 var(--bull);}
+tbody tr.row-failed{box-shadow:inset 3px 0 0 var(--bear);}
+tbody tr.row-test{box-shadow:inset 3px 0 0 var(--gold);}
+.badge-pill{padding:5px 11px;border-radius:999px;font-weight:700;font-size:.72rem;}
+.badge-ok{background:rgba(0,230,118,.15);color:var(--bull);border:1px solid rgba(0,230,118,.4);}
+.badge-bad{background:rgba(255,59,92,.15);color:var(--bear);border:1px solid rgba(255,59,92,.4);}
+.badge-warn{background:rgba(255,213,74,.15);color:var(--gold);border:1px solid rgba(255,213,74,.4);}
+.symbol-tag{font-weight:700;color:#fff;}
+.symbol-tag.clickable{cursor:pointer;text-decoration:underline dotted rgba(255,255,255,.35);text-underline-offset:4px;}
+.empty-state{text-align:center;padding:50px 10px;color:#7c86a8;}
+.footer-note{text-align:center;color:#6a749a;font-size:.78rem;margin-top:18px;}
+.details-btn{background:linear-gradient(120deg,rgba(34,229,255,.18),rgba(160,107,255,.18));border:1px solid rgba(34,229,255,.4);color:#dff6ff;font-weight:700;font-size:.72rem;padding:6px 12px;border-radius:8px;cursor:pointer;white-space:nowrap;}
+.details-btn:hover{border-color:var(--cyan);}
+.details-btn:disabled{opacity:.3;cursor:not-allowed;}
+.oi-modal-backdrop{position:fixed;inset:0;z-index:1000;display:none;align-items:center;justify-content:center;background:rgba(3,5,12,.72);backdrop-filter:blur(6px);}
+.oi-modal-backdrop.show{display:flex;}
+.oi-modal{width:min(560px,92vw);max-height:86vh;overflow:auto;background:linear-gradient(160deg,rgba(18,22,42,.97),rgba(10,13,26,.97));border:1px solid var(--panel-brd);border-radius:18px;}
+.oi-modal-head{display:flex;align-items:center;justify-content:space-between;padding:18px 20px;border-bottom:1px solid var(--panel-brd);}
+.oi-modal-title{display:flex;align-items:center;gap:12px;font-family:'Orbitron',sans-serif;font-weight:700;font-size:1.05rem;color:#fff;}
+.oi-close-btn{background:rgba(255,255,255,.06);border:1px solid var(--panel-brd);color:#dbe1fb;width:32px;height:32px;border-radius:9px;cursor:pointer;}
+.oi-modal-body{padding:20px;}
+.oi-loading,.oi-error{text-align:center;padding:30px 10px;color:#9aa4c7;}
+.oi-error{color:var(--bear);}
+.oi-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+.oi-cell{background:rgba(255,255,255,.04);border:1px solid var(--panel-brd);border-radius:12px;padding:12px 14px;}
+.oi-cell .oi-label{font-size:.7rem;letter-spacing:1px;text-transform:uppercase;color:#9aa4c7;font-weight:600;margin-bottom:4px;}
+.oi-cell .oi-value{font-family:'Orbitron',sans-serif;font-size:1.15rem;font-weight:700;color:#fff;}
+.oi-cell .oi-sub{font-size:.75rem;color:#7c86a8;margin-top:2px;}
+.oi-cell.wide{grid-column:1 / -1;}
+.oi-pos{color:var(--bull) !important;}.oi-neg{color:var(--bear) !important;}
+.oi-cost{border-color:rgba(255,213,74,.35);}.oi-cost .oi-value{color:var(--gold);}
+</style></head><body>
+<div class="bg-grid"></div><div class="floaters" id="floaters"></div>
+<div class="container-fluid">
+  <div class="topbar">
+    <div class="brand">⚡ UNIFIED OI STRATEGY TERMINAL<small>Signal • OI Decay • Multi-timeframe Analysis • Execution</small></div>
+    <div class="live-pill"><span class="live-dot"></span> LIVE</div>
+  </div>
+  <div class="stat-grid">
+    <div class="stat-card"><div class="icon">📡</div><div class="label">Received</div><div class="value" id="s_received">0</div></div>
+    <div class="stat-card"><div class="icon">🧩</div><div class="label">Parsed</div><div class="value" id="s_parsed">0</div></div>
+    <div class="stat-card"><div class="icon">🐂</div><div class="label">Spot Signals</div><div class="value" id="s_spot">0</div></div>
+    <div class="stat-card"><div class="icon">🐻</div><div class="label">Option Strike Signals</div><div class="value" id="s_option">0</div></div>
+    <div class="stat-card"><div class="icon">✈️</div><div class="label">Telegram Sent</div><div class="value" id="s_telegram">0</div></div>
+    <div class="stat-card"><div class="icon">🎯</div><div class="label">Condition Met</div><div class="value" id="s_condition">0</div></div>
+    <div class="stat-card"><div class="icon">✅</div><div class="label">Orders Placed</div><div class="value" id="s_orders">0</div></div>
+    <div class="stat-card"><div class="icon">⚠️</div><div class="label">Errors</div><div class="value" id="s_errors">0</div></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head">
+      <div class="panel-title">🐂 Signal &amp; Execution Log 🐻</div>
+      <div class="search-wrap"><span class="ico">🔍</span><input id="searchBox" type="text" placeholder="Search by symbol name..."></div>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Time</th><th>Signal ID</th><th>Symbol</th><th>Spot LTP</th><th>Strike</th><th>Option Symbol</th><th>Option LTP</th><th>OI Change %</th><th>Stage</th><th>Status</th><th>Message</th><th>Details</th><th>Analysis</th></tr></thead>
+      <tbody id="logs"><tr><td colspan="13" class="empty-state">📊 Awaiting activity...</td></tr></tbody>
+    </table></div>
+  </div>
+  <div class="footer-note">Auto-refreshing every 3s • Unified OI Gate Terminal</div>
+</div>
+
+<div id="oiModalBackdrop" class="oi-modal-backdrop"><div class="oi-modal">
+  <div class="oi-modal-head"><div class="oi-modal-title"><span id="oiSymbolName">—</span><span class="live-pill"><span class="live-dot"></span> LIVE</span></div>
+  <button class="oi-close-btn" id="oiCloseBtn">✕</button></div>
+  <div class="oi-modal-body" id="oiModalBody"><div class="oi-loading">⏳ Fetching live OI stats...</div></div>
+</div></div>
+
 <script>
-const sid = decodeURIComponent(location.pathname.split('/').pop());
-const tone = t => t>0?'bull':t<0?'bear':'neu';
-const mark = t => t>0?'▲':t<0?'▼':'●';
-const esc = s => String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-let last = null;
-
-function card(t){
-  if(t.error) return `<div class="card"><div class="card-h"><b>${t.label}</b><span>${t.role}</span></div><div class="err" style="padding:24px 0">${esc(t.error)}</div></div>`;
-  const sc = t.score, left = sc>=0?50:50+sc/2, w = Math.abs(sc)/2;
-  const col = sc>=0?'var(--bull)':'var(--bear)';
-  const lines = t.rows.map(r=>`<div class="line"><div class="r"><span>${r.k}</span><span class="cell ${tone(r.t)}">${mark(r.t)} ${esc(r.v)}</span></div><small>${esc(r.sub)}</small>${
-    r.k==='RSI 14'?`<div class="meter"><i style="left:calc(${t.rsi}% - 2px)"></i></div>`:''}</div>`).join('');
-  const notes = t.notes.length?`<div class="notes">${t.notes.map(n=>`<div>• ${esc(n)}</div>`).join('')}</div>`:'';
-  return `<div class="card"><div class="card-h"><b>${t.label}</b><span>${t.role} · last bar ${t.last_candle}</span></div>
-  <div class="bar"><u style="left:${left}%;width:${w}%;background:${col}"></u><i style="left:calc(${50+sc/2}% - 1px)"></i></div>
-  <div style="color:var(--mute);font-size:.85rem;margin-top:-6px;margin-bottom:6px">Trend score <b style="color:${col}">${sc>0?'+':''}${sc}</b> (bullish + / bearish −)</div>
-  ${lines}${notes}</div>`;
+let allLogs=[];
+(function(){const box=document.getElementById('floaters'),g=['🐂','🐻','📈','📉','💹'];
+for(let i=0;i<18;i++){const el=document.createElement('span');el.textContent=g[Math.floor(Math.random()*g.length)];
+el.style.left=(Math.random()*100)+'vw';el.style.fontSize=(20+Math.random()*30)+'px';
+el.style.animationDuration=(14+Math.random()*16)+'s';el.style.animationDelay=(Math.random()*14)+'s';box.appendChild(el);}})();
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function badgeFor(s){if(s==='SUCCESS'||s==='TEST_MODE')return 'badge-ok';if(s==='DISCARDED'||s==='BLOCKED')return 'badge-warn';return 'badge-bad';}
+function rowClassFor(s){if(s==='SUCCESS')return 'row-success';if(s==='TEST_MODE')return 'row-test';if(s==='FAILED')return 'row-failed';return '';}
+function renderTable(rows){
+  const tbody=document.getElementById('logs');
+  if(!rows.length){tbody.innerHTML='<tr><td colspan="13" class="empty-state">🔍 No matching signals found...</td></tr>';return;}
+  tbody.innerHTML=rows.map(r=>{
+    const live=!!(r.detail&&r.detail.instrument_key), an=!!(r.detail&&r.detail.has_analysis), sid=esc(r.signal_id);
+    return `<tr class="${rowClassFor(r.status)}"><td>${esc(r.time)}</td><td>${sid}</td>
+    <td><span class="symbol-tag ${live?'clickable':''}" ${live?`onclick="openOiModal('${sid}')"`:''}>${esc(r.symbol)}</span></td>
+    <td>${esc(r.spot_ltp)}</td><td>${esc(r.strike)}</td><td>${esc(r.option_symbol)}</td><td>${esc(r.option_ltp)}</td><td>${esc(r.oi_change_pct)}</td>
+    <td>${esc(r.stage)}</td><td><span class="badge-pill ${badgeFor(r.status)}">${esc(r.status)}</span></td><td>${esc(r.message)}</td>
+    <td><button class="details-btn" ${live?'':'disabled'} onclick="openOiModal('${sid}')">🔎 View OI</button></td>
+    <td><button class="details-btn" ${an?'':'disabled'} onclick="window.open('/analysis/${sid}','an_${sid}','width=1280,height=900')">📊 Analysis</button></td></tr>`;
+  }).join('');
 }
-
-function render(a){
-  last = a;
-  const m = a.meta||{}, ok = a.timeframes.filter(t=>!t.error);
-  const p = (a.alignment+100)/2;
-  const c = a.alignment>=25?'var(--bull)':a.alignment<=-25?'var(--bear)':'var(--gold)';
-  const dirCls = a.direction==='BULL'?'bull':'bear';
-  const head = `<div class="head"><div>
-    <div class="sym">${esc(m.option_symbol||m.underlying||'Signal')}</div>
-    <div class="sub">${esc(m.underlying||'')} spot analysis · alert on ${a.signal_tf_label} chart · ${esc(m.alert_time||'')}</div>
-    <div class="chips"><span class="chip ${dirCls}">${a.direction==='BULL'?'Bullish signal (CE)':'Bearish signal (PE)'}</span>
-    <span class="chip">Spot ${ok.length?ok[0].close:'N/A'}</span>
-    <span class="chip">Updated ${a.generated_at}</span>
-    <button id="rf">Refresh now</button></div></div>
-    <div class="gauge"><div class="verdict" style="color:${c}">${a.verdict}</div>
-    <div class="ring" style="--p:${p};--c:${c}"><div class="ring-in"><b>${a.alignment>0?'+':''}${a.alignment}%</b><span>ALIGNMENT</span></div></div></div></div>`;
-
-  const hdr = a.timeframes.map(t=>`<th>${t.label}<br><span style="font-weight:500">${t.role}</span></th>`).join('');
-  const keys = ok.length?ok[0].rows.map(r=>r.k):[];
-  const body = keys.map((k,i)=>`<tr><td class="k">${k}</td>${a.timeframes.map(t=>t.error?'<td>–</td>':
-    `<td><span class="cell ${tone(t.rows[i].t)}">${mark(t.rows[i].t)} ${esc(t.rows[i].v)}</span></td>`).join('')}</tr>`).join('');
-  const matrix = `<h2>Confluence matrix</h2><div class="panel"><table><thead><tr><th></th>${hdr}</tr></thead><tbody>${body}</tbody></table></div>`;
-
-  document.getElementById('app').innerHTML = head + matrix +
-    `<h2>Timeframe detail</h2><div class="cards">${a.timeframes.map(card).join('')}</div>` +
-    `<h2>Open interest & strikes</h2><div class="oi" id="oi"><div><small>Loading…</small></div></div>`;
-  document.getElementById('rf').onclick = () => load(true);
-}
-
-function pct(v){ if(!v||v==='N/A') return 'N/A'; const n=parseFloat(v); return `<span class="${n<0?'bear-t':'bull-t'}">${v}</span>`; }
-async function loadOi(){
-  const box = document.getElementById('oi'); if(!box) return;
-  try{
-    const d = await (await fetch('/api/details/'+encodeURIComponent(sid))).json();
-    if(d.status!=='ok'){ box.innerHTML='<div><small>OI snapshot</small><b>Not available for this signal</b></div>'; return; }
-    const cell=(l,v)=>`<div><small>${l}</small><b>${v}</b></div>`;
-    box.innerHTML = cell('Option LTP',d.option_ltp)+cell('OI decay (signal strike)',pct(d.option_oi_change_pct))+
-      cell(`OTM1 ${d.otm1_strike} decay`,pct(d.otm1_decay))+cell(`OTM2 ${d.otm2_strike} decay`,pct(d.otm2_decay))+
-      cell(`Opposite ${d.opposite_type} ${d.opposite_strike} decay`,pct(d.opposite_decay))+
-      cell('Lot size',d.lot_size)+cell('Estimated cost','₹ '+d.estimated_cost);
-  }catch(e){ box.innerHTML='<div><small>OI snapshot</small><b>Failed to load</b></div>'; }
-}
-async function load(refresh){
-  try{
-    const r = await fetch('/api/analysis/'+encodeURIComponent(sid)+(refresh?'?refresh=1':''));
-    if(!r.ok){ document.getElementById('app').innerHTML='<div class="err">No analysis stored for this signal. It may have expired after a server restart.</div>'; return; }
-    render(await r.json()); loadOi();
-  }catch(e){ if(!last) document.getElementById('app').innerHTML='<div class="err">Could not reach the server.</div>'; }
-}
-load(false);
-setInterval(()=>load(true), 60000);
+let oiPollTimer=null,oiActive=null;
+function fmtPct(v){if(v===null||v===undefined||v==='N/A')return '<span class="oi-value">N/A</span>';const n=parseFloat(String(v).replace('%',''));return `<span class="oi-value ${!isNaN(n)?(n<0?'oi-neg':'oi-pos'):''}">${esc(v)}</span>`;}
+function renderOiBody(d){document.getElementById('oiModalBody').innerHTML=`<div class="oi-grid">
+<div class="oi-cell wide"><div class="oi-label">Symbol</div><div class="oi-value">${esc(d.symbol||'N/A')}</div><div class="oi-sub">${esc(d.underlying||'')} • Strike ${esc(d.base_strike)} ${esc(d.opt_type||'')}</div></div>
+<div class="oi-cell"><div class="oi-label">OTM1 (${esc(d.otm1_strike??'N/A')})</div>${fmtPct(d.otm1_decay)}<div class="oi-sub">OI Decay</div></div>
+<div class="oi-cell"><div class="oi-label">OTM2 (${esc(d.otm2_strike??'N/A')})</div>${fmtPct(d.otm2_decay)}<div class="oi-sub">OI Decay</div></div>
+<div class="oi-cell wide"><div class="oi-label">Opposite Side (${esc(d.opposite_strike??'N/A')} ${esc(d.opposite_type||'')})</div>${fmtPct(d.opposite_decay)}<div class="oi-sub">OI Decay</div></div>
+<div class="oi-cell"><div class="oi-label">Spot LTP</div><div class="oi-value">${esc(d.spot_ltp??'N/A')}</div></div>
+<div class="oi-cell"><div class="oi-label">Option LTP</div><div class="oi-value">${esc(d.option_ltp??'N/A')}</div><div class="oi-sub">OI Decay: ${esc(d.option_oi_change_pct??'N/A')}</div></div>
+<div class="oi-cell"><div class="oi-label">Lot Size</div><div class="oi-value">${esc(d.lot_size??'N/A')}</div></div>
+<div class="oi-cell oi-cost"><div class="oi-label">Estimated Cost</div><div class="oi-value">₹ ${esc(d.estimated_cost??'N/A')}</div><div class="oi-sub">Lot Size × Option LTP</div></div></div>`;}
+async function fetchOi(id){try{const d=await(await fetch('/api/details/'+encodeURIComponent(id))).json();
+if(d.status!=='ok'){document.getElementById('oiModalBody').innerHTML=`<div class="oi-error">⚠️ ${esc(d.reason||'Unable to load live details')}</div>`;return;}
+document.getElementById('oiSymbolName').textContent=d.symbol||'N/A';renderOiBody(d);}
+catch(e){document.getElementById('oiModalBody').innerHTML='<div class="oi-error">⚠️ Failed to fetch live OI data</div>';}}
+function openOiModal(id){oiActive=id;document.getElementById('oiSymbolName').textContent='—';
+document.getElementById('oiModalBody').innerHTML='<div class="oi-loading">⏳ Fetching live OI stats...</div>';
+document.getElementById('oiModalBackdrop').classList.add('show');fetchOi(id);
+if(oiPollTimer)clearInterval(oiPollTimer);oiPollTimer=setInterval(()=>fetchOi(oiActive),3000);}
+function closeOiModal(){document.getElementById('oiModalBackdrop').classList.remove('show');if(oiPollTimer){clearInterval(oiPollTimer);oiPollTimer=null;}oiActive=null;}
+document.getElementById('oiCloseBtn').addEventListener('click',closeOiModal);
+document.getElementById('oiModalBackdrop').addEventListener('click',e=>{if(e.target.id==='oiModalBackdrop')closeOiModal();});
+function applyFilter(){const q=document.getElementById('searchBox').value.trim().toUpperCase();
+renderTable(!q?allLogs:allLogs.filter(r=>(r.symbol||'').toUpperCase().includes(q)||(r.option_symbol||'').toUpperCase().includes(q)));}
+document.getElementById('searchBox').addEventListener('input',applyFilter);
+async function loadLogs(){try{allLogs=await(await fetch('/api/logs')).json();applyFilter();}catch(e){}}
+async function loadStats(){try{const d=await(await fetch('/api/stats')).json();
+const m={s_received:'received',s_parsed:'parsed',s_spot:'spot_signals',s_option:'option_signals',s_telegram:'telegram_sent',s_condition:'condition_met',s_orders:'orders',s_errors:'errors'};
+for(const k in m)document.getElementById(k).textContent=d[m[k]]??0;}catch(e){}}
+function refreshAll(){loadLogs();loadStats();}
+setInterval(refreshAll,3000);refreshAll();
 </script></body></html>
 """
+
+
+@app.route("/")
+def dashboard():
+    return Response(DASHBOARD_HTML, mimetype="text/html")
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
